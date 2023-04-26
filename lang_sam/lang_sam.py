@@ -1,7 +1,10 @@
 import os
 from urllib import request
 
-import groundingdino.datasets.transforms as T
+import segment_anything.utils.transforms as Seg_T
+import torchvision.transforms as T
+import torchvision.transforms.functional as T_F
+# import groundingdino.datasets.transforms as T
 import numpy as np
 import torch
 from groundingdino.models import build_model
@@ -39,13 +42,13 @@ def load_model_hf(repo_id, filename, ckpt_config_filename, device='cpu'):
 
 def transform_image(image) -> torch.Tensor:
     transform = T.Compose([
-        T.RandomResize([800], max_size=1333),
-        T.ToTensor(),
+        T.Lambda(lambda x: T_F.resize(x, size=800)),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    image_transformed, _ = transform(image, None)
+    image_transformed = transform(image)
     return image_transformed
+
 
 
 class LangSAM():
@@ -71,6 +74,7 @@ class LangSAM():
                 re-downloading it.")
         sam.to(device=self.device)
         self.sam = SamPredictor(sam)
+        self.sam_encoder = sam
 
     def build_groundingdino(self):
         ckpt_repo_id = "ShilongLiu/GroundingDINO"
@@ -80,28 +84,30 @@ class LangSAM():
 
     def predict_dino(self, image_pil, text_prompt, box_threshold, text_threshold):
         image_trans = transform_image(image_pil)
+
         boxes, logits, phrases = predict(model=self.groundingdino,
                                          image=image_trans,
                                          caption=text_prompt,
                                          box_threshold=box_threshold,
                                          text_threshold=text_threshold,
                                          device=self.device)
-        W, H = image_pil.size
+        W, H = image_pil.shape[-1], image_pil.shape[-2]
         boxes = box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([W, H, W, H])
 
         return boxes, logits, phrases
 
     def predict_sam(self, image_pil, boxes):
-        image_array = np.asarray(image_pil)
-        self.sam.set_image(image_array)
-        transformed_boxes = self.sam.transform.apply_boxes_torch(boxes, image_array.shape[:2])
+        seg_anything_T = Seg_T.ResizeLongestSide(self.sam_encoder.image_encoder.img_size)
+        self.sam.set_torch_image(seg_anything_T.apply_image_torch(image_pil), image_pil.shape[-2:])
+        transformed_boxes = self.sam.transform.apply_boxes_torch(boxes, image_pil.shape[-2:])
         masks, _, _ = self.sam.predict_torch(
             point_coords=None,
             point_labels=None,
             boxes=transformed_boxes.to(self.sam.device),
             multimask_output=False,
         )
-        return masks.cpu()
+
+        return masks
 
     def predict(self, image_pil, text_prompt, box_threshold=0.3, text_threshold=0.25):
         boxes, logits, phrases = self.predict_dino(image_pil, text_prompt, box_threshold, text_threshold)
